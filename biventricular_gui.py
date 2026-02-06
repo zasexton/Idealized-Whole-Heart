@@ -789,8 +789,26 @@ class BiventricularViewer(QtWidgets.QMainWindow):
         kind = self.combo_implicit_type.currentData()
         res = int(self.implicit_resolution.value())
 
-        lv_epi = lv["epi_mesh"].triangulate().clean().compute_normals(auto_orient_normals=True)
-        rv_epi = rv["epi_mesh"].triangulate().clean().compute_normals(auto_orient_normals=True)
+        # The generated meshes are truncated (open boundaries). Cap openings so
+        # implicit distance fields don't create a spurious "closure" at the grid
+        # bounds during marching cubes.
+        hole_size = 1000.0
+        lv_epi = (
+            lv["epi_mesh"]
+            .triangulate()
+            .clean()
+            .fill_holes(hole_size)
+            .clean()
+            .compute_normals(auto_orient_normals=True)
+        )
+        rv_epi = (
+            rv["epi_mesh"]
+            .triangulate()
+            .clean()
+            .fill_holes(hole_size)
+            .clean()
+            .compute_normals(auto_orient_normals=True)
+        )
 
         bounds = self._implicit_bounds(lv_epi, rv_epi)
         xmin, xmax, ymin, ymax, zmin, zmax = bounds
@@ -814,8 +832,22 @@ class BiventricularViewer(QtWidgets.QMainWindow):
             del grid.point_data["implicit_distance"]
 
             if kind == "myocardium":
-                lv_endo = lv["endo_mesh"].triangulate().clean().compute_normals(auto_orient_normals=True)
-                rv_endo = rv["endo_mesh"].triangulate().clean().compute_normals(auto_orient_normals=True)
+                lv_endo = (
+                    lv["endo_mesh"]
+                    .triangulate()
+                    .clean()
+                    .fill_holes(hole_size)
+                    .clean()
+                    .compute_normals(auto_orient_normals=True)
+                )
+                rv_endo = (
+                    rv["endo_mesh"]
+                    .triangulate()
+                    .clean()
+                    .fill_holes(hole_size)
+                    .clean()
+                    .compute_normals(auto_orient_normals=True)
+                )
 
                 grid.compute_implicit_distance(lv_endo, inplace=True)
                 lv_endo_dist = np.asarray(grid.point_data["implicit_distance"]).copy()
@@ -957,4 +989,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
