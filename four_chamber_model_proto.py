@@ -752,6 +752,303 @@ def build_ra_mesh(
     
     return surf
 
+def build_pulmonary_trunk(
+    rv_result: dict,
+    outer_radius: float = 0.45,
+    wall_thickness: float = 0.1,
+    length: float = 2.2,
+    bend: float = 0.9,
+    n_samples: int = 160,
+    n_theta: int = 48,
+    z_offset: float = -0.02,
+    slab_tol: float = 0.03,
+    safety: float = 0.98,
+    xy_bias: tuple[float, float] = (0.0, 0.45),
+) -> dict:
+    rv_endo = rv_result["endo_mesh"]
+
+    # Choose base point for centerline:
+    z_top = float(rv_endo.bounds[5])
+    z0 = z_top + float(z_offset)
+
+    pts = np.asarray(rv_endo.points)
+    slab = pts[np.abs(pts[:, 2] - z0) < slab_tol]
+    if len(slab) < 30:
+        slab = pts[np.abs(pts[:, 2] - z0) < 3 * slab_tol]
+
+    if len(slab) < 30:
+        cx, cy = rv_endo.center[0], rv_endo.center[1]
+        R_avail = 0.25 * max(rv_endo.length, 1e-6)
+    else:
+        cx, cy = slab[:, 0].mean(), slab[:, 1].mean()
+        r = np.sqrt((slab[:, 0] - cx) ** 2 + (slab[:, 1] - cy) ** 2)
+        R_avail = float(np.percentile(r, 80))
+
+    allow = max((R_avail - outer_radius) * safety, 0.0)
+    b = np.array([xy_bias[0], xy_bias[1]], dtype=float)
+    nb = np.linalg.norm(b)
+    if nb > 1e-12:
+        b = b * min(1.0, allow / nb)
+    else:
+        b[:] = 0.0
+
+    p0 = np.array([cx + b[0], cy + b[1], z0], dtype=float)
+
+    # Create centerline:
+    p1 = p0 + np.array([0.0, 0.0, 0.35 * length])
+    p2 = p0 + np.array([0.35 * bend * length, 0.10 * bend * length, 0.75 * length])
+    p3 = p0 + np.array([0.55 * bend * length, 0.15 * bend * length, 1.00 * length])
+
+    t = np.linspace(0.0, 1.0, n_samples)
+    cl = (
+            (1 - t)[:, None] ** 3 * p0
+            + 3 * (1 - t)[:, None] ** 2 * t[:, None] * p1
+            + 3 * (1 - t)[:, None] * t[:, None] ** 2 * p2
+            + t[:, None] ** 3 * p3
+    )
+
+    def unit(v):
+        n = np.linalg.norm(v)
+        return v / (n if n > 1e-12 else 1.0)
+
+    Np = len(cl)
+    T = np.zeros((Np, 3))
+    for i in range(Np):
+        if i == 0:
+            T[i] = unit(cl[1] - cl[0])
+        elif i == Np - 1:
+            T[i] = unit(cl[-1] - cl[-2])
+        else:
+            T[i] = unit(cl[i + 1] - cl[i - 1])
+
+    up = unit(np.array([0.0, 0.0, 1.0]))
+    if abs(np.dot(up, T[0])) > 0.95:
+        up = unit(np.array([0.0, 1.0, 0.0]))
+
+    B = unit(np.cross(T[0], up))
+    Nvec = unit(np.cross(B, T[0]))
+
+    N_arr = np.zeros((Np, 3))
+    B_arr = np.zeros((Np, 3))
+    N_arr[0], B_arr[0] = Nvec, B
+
+    for i in range(1, Np):
+        v = np.cross(T[i - 1], T[i])
+        s = np.linalg.norm(v)
+        c = np.dot(T[i - 1], T[i])
+        if s < 1e-10:
+            N_arr[i] = N_arr[i - 1]
+            B_arr[i] = B_arr[i - 1]
+            continue
+        v = v / s
+        ang = np.arctan2(s, c)
+
+        # Rodrigues rotate previous normal around axis v
+        a = N_arr[i - 1]
+        N_new = a * np.cos(ang) + np.cross(v, a) * np.sin(ang) + v * np.dot(v, a) * (1 - np.cos(ang))
+        N_new = unit(N_new)
+        B_new = unit(np.cross(T[i], N_new))
+
+        N_arr[i], B_arr[i] = N_new, B_new
+
+    # Revolve about inner and outer radii:
+    r_out = float(outer_radius)
+    r_in = max(r_out - float(wall_thickness), 1e-6)
+    theta = np.linspace(0, 2 * np.pi, n_theta, endpoint=False)
+
+    outer_pts = np.zeros((Np, n_theta, 3))
+    inner_pts = np.zeros((Np, n_theta, 3))
+
+    for i in range(Np):
+        ct = np.cos(theta)
+        st = np.sin(theta)
+        ring_dir = ct[:, None] * N_arr[i][None, :] + st[:, None] * B_arr[i][None, :]
+        outer_pts[i] = cl[i][None, :] + r_out * ring_dir
+        inner_pts[i] = cl[i][None, :] + r_in * ring_dir
+
+    def skin(pts_grid):
+        pts_flat = pts_grid.reshape(-1, 3)
+        faces = []
+        for i in range(Np - 1):
+            for j in range(n_theta):
+                jn = (j + 1) % n_theta
+                p00 = i * n_theta + j
+                p01 = i * n_theta + jn
+                p11 = (i + 1) * n_theta + jn
+                p10 = (i + 1) * n_theta + j
+                faces.extend([4, p00, p01, p11, p10])
+        return pv.PolyData(pts_flat, np.array(faces, dtype=np.int64)).triangulate().clean()
+
+    outer = skin(outer_pts).compute_normals(auto_orient_normals=True)
+    inner = skin(inner_pts).compute_normals(auto_orient_normals=True)
+
+    inner_rev = inner.copy(deep=True)
+    inner_rev.flip_faces()
+
+    solid = outer.merge(inner_rev, merge_points=False).compute_normals(auto_orient_normals=True)
+
+    return {
+        "centerline": cl,
+        "outer": outer,
+        "inner": inner,
+        "mesh": solid
+    }
+
+def build_aorta(
+    lv_result: dict,
+    outer_radius: float = 0.48,
+    wall_thickness: float = 0.10,
+    length: float = 2.0,
+    arch_height: float = 1.4,
+    arch_over: float = 2.2,
+    twist_turns: float = 0.35,  # number of full rotations along length
+    n_samples: int = 220,
+    n_theta: int = 56,
+    z_offset: float = -0.02,
+    slab_tol: float = 0.03,
+    safety: float = 0.98,
+    xy_bias: tuple[float, float] = (-0.15, -0.35),
+) -> dict:
+    """
+    Build aorta as a thick tube skinned around a cubic Bezier centerline + twist.
+
+    Returns dict with:
+      'centerline': (n_samples,3) ndarray
+      'outer': pv.PolyData
+      'inner': pv.PolyData
+      'mesh': pv.PolyData  (outer + reversed inner; no end caps)
+    """
+
+    lv_endo = lv_result["endo_mesh"]
+
+    # Choose base point for centerline:
+    z_top = float(lv_endo.bounds[5])
+    z0 = z_top + float(z_offset)
+
+    pts = np.asarray(lv_endo.points)
+    slab = pts[np.abs(pts[:, 2] - z0) < slab_tol]
+    if len(slab) < 30:
+        slab = pts[np.abs(pts[:, 2] - z0) < 3 * slab_tol]
+
+    if len(slab) < 30:
+        cx, cy = lv_endo.center[0], lv_endo.center[1]
+        R_avail = 0.25 * max(lv_endo.length, 1e-6)
+    else:
+        cx, cy = slab[:, 0].mean(), slab[:, 1].mean()
+        r = np.sqrt((slab[:, 0] - cx) ** 2 + (slab[:, 1] - cy) ** 2)
+        R_avail = float(np.percentile(r, 80))
+
+    allow = max((R_avail - outer_radius) * safety, 0.0)
+    b = np.array([xy_bias[0], xy_bias[1]], dtype=float)
+    nb = np.linalg.norm(b)
+    if nb > 1e-12:
+        b = b * min(1.0, allow / nb)
+    else:
+        b[:] = 0.0
+
+    p0 = np.array([cx + b[0], cy + b[1], z0], dtype=float)
+
+    # Aorta arch centerline
+    # Scale controls with length
+    p1 = p0 + np.array([0.10 * arch_over * length, 0.00 * arch_over * length, 0.55 * arch_height * length])
+    p2 = p0 + np.array([-0.55 * arch_over * length, -0.45 * arch_over * length, 1.00 * arch_height * length])
+    p3 = p0 + np.array([-1.00 * arch_over * length, -0.80 * arch_over * length, 0.70 * arch_height * length])
+
+    t = np.linspace(0.0, 1.0, n_samples)
+    cl = (
+        (1 - t)[:, None] ** 3 * p0
+        + 3 * (1 - t)[:, None] ** 2 * t[:, None] * p1
+        + 3 * (1 - t)[:, None] * t[:, None] ** 2 * p2
+        + t[:, None] ** 3 * p3
+    )
+    def unit(v):
+        n = np.linalg.norm(v)
+        return v / (n if n > 1e-12 else 1.0)
+
+    Np = len(cl)
+    T = np.zeros((Np, 3))
+    for i in range(Np):
+        if i == 0:
+            T[i] = unit(cl[1] - cl[0])
+        elif i == Np - 1:
+            T[i] = unit(cl[-1] - cl[-2])
+        else:
+            T[i] = unit(cl[i + 1] - cl[i - 1])
+
+    up = unit(np.array([0.0, 0.0, 1.0]))
+    if abs(np.dot(up, T[0])) > 0.95:
+        up = unit(np.array([0.0, 1.0, 0.0]))
+
+    B = unit(np.cross(T[0], up))
+    Nvec = unit(np.cross(B, T[0]))
+
+    N_arr = np.zeros((Np, 3))
+    B_arr = np.zeros((Np, 3))
+    N_arr[0], B_arr[0] = Nvec, B
+
+    for i in range(1, Np):
+        v = np.cross(T[i - 1], T[i])
+        s = np.linalg.norm(v)
+        c = np.dot(T[i - 1], T[i])
+        if s < 1e-10:
+            N_arr[i] = N_arr[i - 1]
+            B_arr[i] = B_arr[i - 1]
+            continue
+        v = v / s
+        ang = np.arctan2(s, c)
+
+        a = N_arr[i - 1]
+        N_new = a * np.cos(ang) + np.cross(v, a) * np.sin(ang) + v * np.dot(v, a) * (1 - np.cos(ang))
+        N_new = unit(N_new)
+        B_new = unit(np.cross(T[i], N_new))
+
+        N_arr[i], B_arr[i] = N_new, B_new
+
+    # Revolve about centerline
+    r_out = float(outer_radius)
+    r_in = max(r_out - float(wall_thickness), 1e-6)
+    theta = np.linspace(0, 2 * np.pi, n_theta, endpoint=False)
+
+    outer_pts = np.zeros((Np, n_theta, 3))
+    inner_pts = np.zeros((Np, n_theta, 3))
+
+    for i in range(Np):
+        twist = 2 * np.pi * twist_turns * (i / max(Np - 1, 1))
+        ct = np.cos(theta + twist)
+        st = np.sin(theta + twist)
+        ring_dir = ct[:, None] * N_arr[i][None, :] + st[:, None] * B_arr[i][None, :]
+        outer_pts[i] = cl[i][None, :] + r_out * ring_dir
+        inner_pts[i] = cl[i][None, :] + r_in * ring_dir
+
+    def skin(pts_grid):
+        pts_flat = pts_grid.reshape(-1, 3)
+        faces = []
+        for i in range(Np - 1):
+            for j in range(n_theta):
+                jn = (j + 1) % n_theta
+                p00 = i * n_theta + j
+                p01 = i * n_theta + jn
+                p11 = (i + 1) * n_theta + jn
+                p10 = (i + 1) * n_theta + j
+                faces.extend([4, p00, p01, p11, p10])
+        return pv.PolyData(pts_flat, np.array(faces, dtype=np.int64)).triangulate().clean()
+
+    outer = skin(outer_pts).compute_normals(auto_orient_normals=True)
+    inner = skin(inner_pts).compute_normals(auto_orient_normals=True)
+
+    inner_rev = inner.copy(deep=True)
+    inner_rev.flip_faces()
+    solid = outer.merge(inner_rev, merge_points=False).compute_normals(auto_orient_normals=True)
+
+    return {
+        "centerline": cl,
+        "outer": outer,
+        "inner": inner,
+        "mesh": solid
+    }
+
+
+
 
 def visualize_geometry():
     """
@@ -770,6 +1067,12 @@ def visualize_geometry():
 
     # Create RA:
     ra_mesh = build_ra_mesh(lv_result, rv_result)
+
+    # Create Pulmonary Trunk:
+    pulm = build_pulmonary_trunk(rv_result)
+
+    # Create Aorta:
+    aorta = build_aorta(lv_result)
 
     # Visualize
     plotter = pv.Plotter()
@@ -802,6 +1105,13 @@ def visualize_geometry():
     plotter.add_mesh(la_mesh, color="goldenrod", opacity=0.6)
 
     plotter.add_mesh(ra_mesh, color="darkviolet", opacity=0.6)
+
+    plotter.add_mesh(pv.lines_from_points(pulm["centerline"]), color="darkgreen", line_width=3)
+    plotter.add_mesh(pulm["mesh"], color="darkgreen", line_width=3)
+
+    plotter.add_mesh(pv.lines_from_points(aorta["centerline"]), color="firebrick", line_width=3)
+    plotter.add_mesh(aorta["mesh"], color="firebrick", line_width=3)
+
 
     # Add text annotation
     plotter.camera_position = 'iso'
