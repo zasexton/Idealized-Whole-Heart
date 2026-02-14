@@ -749,7 +749,7 @@ def build_ra_mesh(
     surf = surf.triangulate().clean(tolerance=1e-7)
     surf = surf.smooth(n_iter=30, relaxation_factor=0.05, feature_smoothing=False, boundary_smoothing=True)
     surf = surf.compute_normals(auto_orient_normals=True, consistent_normals=True)
-    
+
     return surf
 
 def build_pulmonary_trunk(
@@ -763,7 +763,7 @@ def build_pulmonary_trunk(
     z_offset: float = -0.02,
     slab_tol: float = 0.03,
     safety: float = 0.98,
-    xy_bias: tuple[float, float] = (0.0, 0.45),
+    xy_bias: tuple[float, float] = (-0.8, 0.45),
 ) -> dict:
     rv_endo = rv_result["endo_mesh"]
 
@@ -898,30 +898,32 @@ def build_aorta(
     lv_result: dict,
     outer_radius: float = 0.48,
     wall_thickness: float = 0.10,
-    length: float = 2.0,
-    arch_height: float = 1.4,
-    arch_over: float = 2.2,
-    twist_turns: float = 0.35,  # number of full rotations along length
-    n_samples: int = 220,
-    n_theta: int = 56,
+    straight_up: float = 2.0,  # ascending aorta length
+    arch_radius: float = 1.8,  # radius of arched portion
+    arch_angle_deg: float = 165.0,
+    end_straight: float = 0.8,  # descending aorta length
+    # orientation: arch plane directions in x/y
+    arch_dir_xy: tuple[float, float] = (-1.0, -0.35),
+    # placement
     z_offset: float = -0.02,
     slab_tol: float = 0.03,
     safety: float = 0.98,
-    xy_bias: tuple[float, float] = (-0.15, -0.35),
+    xy_bias: tuple[float, float] = (-0.15, -0.35),  # root bias inside LV top
+    # meshing
+    n_up: int = 40,
+    n_arch: int = 140,
+    n_down: int = 40,
+    n_theta: int = 56,
+    twist_turns: float = 0.20,  # mild helical twist along the tube
 ) -> dict:
     """
-    Build aorta as a thick tube skinned around a cubic Bezier centerline + twist.
-
-    Returns dict with:
-      'centerline': (n_samples,3) ndarray
-      'outer': pv.PolyData
-      'inner': pv.PolyData
-      'mesh': pv.PolyData  (outer + reversed inner; no end caps)
+    Aorta as: straight-up segment + upside-down U arch + short descending segment,
+    then skinned into a thick-walled tube.
     """
 
     lv_endo = lv_result["endo_mesh"]
 
-    # Choose base point for centerline:
+    # Pick base point for centerline:
     z_top = float(lv_endo.bounds[5])
     z0 = z_top + float(z_offset)
 
@@ -948,19 +950,52 @@ def build_aorta(
 
     p0 = np.array([cx + b[0], cy + b[1], z0], dtype=float)
 
-    # Aorta arch centerline
-    # Scale controls with length
-    p1 = p0 + np.array([0.10 * arch_over * length, 0.00 * arch_over * length, 0.55 * arch_height * length])
-    p2 = p0 + np.array([-0.55 * arch_over * length, -0.45 * arch_over * length, 1.00 * arch_height * length])
-    p3 = p0 + np.array([-1.00 * arch_over * length, -0.80 * arch_over * length, 0.70 * arch_height * length])
+    # Making centerline:
+    dxy = np.array([arch_dir_xy[0], arch_dir_xy[1], 0.0], dtype=float)
+    nd = np.linalg.norm(dxy[:2])
+    if nd < 1e-12:
+        dxy = np.array([-1.0, 0.0, 0.0], dtype=float)
+    else:
+        dxy[:2] /= nd  # normalize xy only
+    ex = dxy                   # arch sweeps along ex
+    ez = np.array([0.0, 0.0, 1.0], dtype=float)
 
-    t = np.linspace(0.0, 1.0, n_samples)
-    cl = (
-        (1 - t)[:, None] ** 3 * p0
-        + 3 * (1 - t)[:, None] ** 2 * t[:, None] * p1
-        + 3 * (1 - t)[:, None] * t[:, None] ** 2 * p2
-        + t[:, None] ** 3 * p3
-    )
+    # Ascending aorta:
+    z_up = np.linspace(0.0, straight_up, max(n_up, 2))
+    up_pts = p0[None, :] + z_up[:, None] * ez[None, :]
+
+    # Create arc over ascending portion
+    phi0 = np.deg2rad(0.0 + (180.0 - arch_angle_deg) * 0.5)
+    phi1 = np.deg2rad(180.0 - (180.0 - arch_angle_deg) * 0.5)
+    phi = np.linspace(phi0, phi1, max(n_arch, 3))
+
+    # Place the arch center at the end of ascending, shifted by +R in z so the arch is above it.
+    p_up_end = up_pts[-1]
+    c = p_up_end + arch_radius * ez
+
+    # Arch points in local (ex, ez) plane
+    arch_pts = (c[None, :]
+                + arch_radius * np.cos(phi)[:, None] * ex[None, :]
+                + arch_radius * np.sin(phi)[:, None] * ez[None, :])
+
+    # Connect smoothly: shift arch so its first point equals p_up_end
+    arch_pts = arch_pts + (p_up_end - arch_pts[0])
+
+    # Descending segment: along -z plus a bit along ex to keep going outward
+    phi_end = phi[-1]
+    t_end = (-np.sin(phi_end) * ex + np.cos(phi_end) * ez)
+    t_end = t_end / (np.linalg.norm(t_end) + 1e-12)
+
+    down_dir = t_end - 0.65 * ez
+    down_dir = down_dir / (np.linalg.norm(down_dir) + 1e-12)
+
+    s = np.linspace(0.0, end_straight, max(n_down, 2))
+    down_pts = arch_pts[-1][None, :] + s[:, None] * down_dir[None, :]
+
+    # Concatenate (avoid duplicate endpoints)
+    cl = np.vstack([up_pts, arch_pts[1:], down_pts[1:]])
+
+    # Build frames along centerline
     def unit(v):
         n = np.linalg.norm(v)
         return v / (n if n > 1e-12 else 1.0)
@@ -979,32 +1014,30 @@ def build_aorta(
     if abs(np.dot(up, T[0])) > 0.95:
         up = unit(np.array([0.0, 1.0, 0.0]))
 
-    B = unit(np.cross(T[0], up))
-    Nvec = unit(np.cross(B, T[0]))
+    B0 = unit(np.cross(T[0], up))
+    N0 = unit(np.cross(B0, T[0]))
 
     N_arr = np.zeros((Np, 3))
     B_arr = np.zeros((Np, 3))
-    N_arr[0], B_arr[0] = Nvec, B
+    N_arr[0], B_arr[0] = N0, B0
 
     for i in range(1, Np):
         v = np.cross(T[i - 1], T[i])
-        s = np.linalg.norm(v)
-        c = np.dot(T[i - 1], T[i])
-        if s < 1e-10:
+        srot = np.linalg.norm(v)
+        crot = np.dot(T[i - 1], T[i])
+        if srot < 1e-10:
             N_arr[i] = N_arr[i - 1]
             B_arr[i] = B_arr[i - 1]
             continue
-        v = v / s
-        ang = np.arctan2(s, c)
+        v = v / srot
+        ang = np.arctan2(srot, crot)
 
         a = N_arr[i - 1]
         N_new = a * np.cos(ang) + np.cross(v, a) * np.sin(ang) + v * np.dot(v, a) * (1 - np.cos(ang))
         N_new = unit(N_new)
         B_new = unit(np.cross(T[i], N_new))
-
         N_arr[i], B_arr[i] = N_new, B_new
 
-    # Revolve about centerline
     r_out = float(outer_radius)
     r_in = max(r_out - float(wall_thickness), 1e-6)
     theta = np.linspace(0, 2 * np.pi, n_theta, endpoint=False)
@@ -1046,8 +1079,6 @@ def build_aorta(
         "inner": inner,
         "mesh": solid
     }
-
-
 
 
 def visualize_geometry():
